@@ -1,0 +1,54 @@
+services:
+  velostream:
+    image: velostream:latest
+    container_name: velostream
+    restart: always
+    env_file:
+      - .env.velostream
+    depends_on:
+      - db
+    networks:
+      - velostream-net
+      - cloudflare_net
+  web:
+    image: velostream-frontend:latest
+    container_name: velostream-web
+    environment:
+      - NODE_ENV=production
+      - PORT=3150
+      - API_URL=http://velostream:3152
+    restart: unless-stopped
+    depends_on:
+      - db
+      - velostream
+    networks:
+      - velostream-net
+      - cloudflare_net
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:3150/login || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  db:
+    image: postgres:16-alpine
+    container_name: velostream-db
+    restart: always
+    env_file:
+      - .env.db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - velostream-net
+      - cloudflare_net
+volumes:
+  pgdata:
+
+
+networks:
+  velostream-net:
+    driver: bridge
+  cloudflare_net:
+    external: true
+
