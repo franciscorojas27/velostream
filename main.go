@@ -29,6 +29,16 @@ type VideoInfo struct {
 	Author      string `json:"author"`
 }
 
+type MP3InfoRequest struct {
+	ID string `json:"id"`
+}
+
+type MP3InfoResponse struct {
+	ID   string `json:"id"`
+	URL  string `json:"url"`
+	Type string `json:"type"`
+}
+
 func isValidID(id string) bool {
 	return regexp.MustCompile(`^[a-zA-Z0-9_-]{11}$`).MatchString(id)
 }
@@ -178,6 +188,37 @@ func main() {
 		}
 
 		return c.JSON(info)
+	})
+	app.Post("/mp3/info", func(c *fiber.Ctx) error {
+		var req MP3InfoRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid body. Expected JSON with id"})
+		}
+
+		videoID := strings.TrimSpace(req.ID)
+		if !isValidID(videoID) {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid Video ID"})
+		}
+
+		logger.Info("MP3 info request received", "videoID", videoID, "ip", c.IP())
+
+		cleanURL := "https://www.youtube.com/watch?v=" + videoID
+		cmd := exec.Command("yt-dlp", "--no-warnings", "-f", "bestaudio", "--get-url", "--", cleanURL)
+		output, err := cmd.Output()
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to retrieve MP3 URL"})
+		}
+
+		mp3URL := strings.TrimSpace(string(output))
+		if mp3URL == "" {
+			return c.Status(500).JSON(fiber.Map{"error": "Empty URL returned by yt-dlp"})
+		}
+
+		return c.JSON(MP3InfoResponse{
+			ID:   videoID,
+			URL:  mp3URL,
+			Type: "bestaudio",
+		})
 	})
 	port := os.Getenv("PORT")
 	if port == "" {
