@@ -1,13 +1,25 @@
+FROM golang:1.26-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /app
+
+COPY go.mod go.sum* ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o velostream .
+
 FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates ffmpeg yt-dlp
 
 WORKDIR /app
 
-COPY velostream .
+COPY --from=builder /app/velostream .
 
 RUN chmod +x velostream
 
-EXPOSE 3000
+EXPOSE 3152
 
 CMD ["./velostream"]
