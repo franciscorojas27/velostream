@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -18,8 +19,17 @@ import (
 )
 
 var (
-	logger *slog.Logger
+	logger         *slog.Logger
+	mp3InfoCache   = make(map[string]cachedMP3Info)
+	mp3InfoCacheMu sync.RWMutex
 )
+
+const mp3InfoCacheTTL = 10 * time.Minute
+
+type cachedMP3Info struct {
+	Data      MP3InfoResponse
+	ExpiresAt time.Time
+}
 
 type VideoInfo struct {
 	Title       string `json:"title"`
@@ -34,10 +44,16 @@ type MP3InfoRequest struct {
 }
 
 type MP3InfoResponse struct {
-	ID   string `json:"id"`
-	URL  string `json:"url"`
-	Type string `json:"type"`
-	Name string `json:"name"`
+	ID           string `json:"id"`
+	URL          string `json:"url"`
+	Type         string `json:"type"`
+	MimeType     string `json:"mimeType"`
+	Name         string `json:"name"`
+	Duration     string `json:"duration"`
+	Thumbnail    string `json:"thumbnail"`
+	Author       string `json:"author"`
+	AudioQuality string `json:"audioQuality"`
+	Cached       bool   `json:"cached"`
 }
 
 func isValidID(id string) bool {
@@ -46,6 +62,60 @@ func isValidID(id string) bool {
 
 func cleanFileName(title string) string {
 	return regexp.MustCompile(`[\\/:*?"<>|]`).ReplaceAllString(title, "")
+}
+
+func getBestThumbnail(video *youtube.Video) string {
+	if len(video.Thumbnails) == 0 {
+		return ""
+	}
+
+	best := video.Thumbnails[0]
+	bestArea := best.Width * best.Height
+
+	for _, thumb := range video.Thumbnails[1:] {
+		area := thumb.Width * thumb.Height
+		if area > bestArea {
+			best = thumb
+			bestArea = area
+		}
+	}
+
+	return best.URL
+}
+
+func getBestAudioFormat(formats youtube.FormatList) *youtube.Format {
+	var best *youtube.Format
+
+	for i := range formats {
+		f := &formats[i]
+		if f.AudioChannels <= 0 {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(f.MimeType), "audio/") {
+			continue
+		}
+		if best == nil || f.Bitrate > best.Bitrate {
+			best = f
+		}
+	}
+
+	if best != nil {
+		return best
+	}
+
+	audioFormats := formats.WithAudioChannels()
+	if len(audioFormats) == 0 {
+		return nil
+	}
+
+	bestIdx := 0
+	for i := 1; i < len(audioFormats); i++ {
+		if audioFormats[i].Bitrate > audioFormats[bestIdx].Bitrate {
+			bestIdx = i
+		}
+	}
+
+	return &audioFormats[bestIdx]
 }
 
 func startCleanupTask() {
@@ -183,7 +253,7 @@ func main() {
 		info := VideoInfo{
 			Title:       video.Title,
 			Description: video.Description,
-			Thumbnail:   video.Thumbnails[1].URL,
+			Thumbnail:   getBestThumbnail(video),
 			Duration:    video.Duration.String(),
 			Author:      video.Author,
 		}
@@ -203,36 +273,61 @@ func main() {
 
 		logger.Info("MP3 info request received", "videoID", videoID, "ip", c.IP())
 
-		cleanURL := "https://www.youtube.com/watch?v=" + videoID
-		cmd := exec.Command("yt-dlp", "--no-warnings", "-f", "bestaudio", "--get-title", "--get-url", "--", cleanURL)
-		output, err := cmd.Output()
+		mp3InfoCacheMu.RLock()
+		cached, found := mp3InfoCache[videoID]
+		mp3InfoCacheMu.RUnlock()
+		if found && time.Now().Before(cached.ExpiresAt) {
+			res := cached.Data
+			res.Cached = true
+			return c.JSON(res)
+		}
+
+		client := youtube.Client{}
+		video, err := client.GetVideo(videoID)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to retrieve MP3 metadata"})
+		}
+
+		bestAudioFormat := getBestAudioFormat(video.Formats)
+		if bestAudioFormat == nil {
+			return c.Status(500).JSON(fiber.Map{"error": "No audio format available"})
+		}
+
+		mp3URL, err := client.GetStreamURL(video, bestAudioFormat)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to retrieve MP3 URL"})
 		}
 
-		parts := strings.Split(strings.TrimSpace(string(output)), "\n")
-		var title, mp3URL string
-		if len(parts) >= 2 {
-			title = strings.TrimSpace(parts[0])
-			mp3URL = strings.TrimSpace(parts[len(parts)-1])
-		} else if len(parts) == 1 {
-			mp3URL = strings.TrimSpace(parts[0])
-		}
-
 		if mp3URL == "" {
-			return c.Status(500).JSON(fiber.Map{"error": "Empty URL returned by yt-dlp"})
+			return c.Status(500).JSON(fiber.Map{"error": "Empty URL returned by YouTube"})
 		}
 
+		title := strings.TrimSpace(video.Title)
 		if title == "" {
 			title = videoID
 		}
 
-		return c.JSON(MP3InfoResponse{
-			ID:   videoID,
-			URL:  mp3URL,
-			Type: "bestaudio",
-			Name: title,
-		})
+		response := MP3InfoResponse{
+			ID:           videoID,
+			URL:          mp3URL,
+			Type:         "audio",
+			MimeType:     bestAudioFormat.MimeType,
+			Name:         title,
+			Duration:     video.Duration.String(),
+			Thumbnail:    getBestThumbnail(video),
+			Author:       video.Author,
+			AudioQuality: bestAudioFormat.AudioQuality,
+			Cached:       false,
+		}
+
+		mp3InfoCacheMu.Lock()
+		mp3InfoCache[videoID] = cachedMP3Info{
+			Data:      response,
+			ExpiresAt: time.Now().Add(mp3InfoCacheTTL),
+		}
+		mp3InfoCacheMu.Unlock()
+
+		return c.JSON(response)
 	})
 	port := os.Getenv("PORT")
 	if port == "" {
